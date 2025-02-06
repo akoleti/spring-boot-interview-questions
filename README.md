@@ -1415,5 +1415,822 @@ public class ReportingService {
     }
 }
 ```
+### 18. Implementing Advanced Caching Strategies in Spring Boot
 
+Caching is a critical performance optimization technique in enterprise applications. Let's explore how to implement effective caching strategies in Spring Boot.
+
+First, let's understand the caching flow:
+
+```mermaid
+graph TD
+    A[Client Request] --> B{Cache Hit?}
+    B -->|Yes| C[Return Cached Data]
+    B -->|No| D[Load from Database]
+    D --> E[Process Data]
+    E --> F[Cache Result]
+    F --> G[Return Response]
+    C --> G
+    H[Cache Eviction Policy] --> I{Eviction Trigger?}
+    I -->|Time| J[Time-based Eviction]
+    I -->|Size| K[Size-based Eviction]
+    I -->|Manual| L[Manual Eviction]
+```
+
+Let's implement a multi-level caching strategy:
+
+```java
+@Configuration
+@EnableCaching
+public class MultiLevelCacheConfig {
+    
+    @Bean
+    public CacheManager cacheManager() {
+        // Create a composite cache manager for multi-level caching
+        CompositeCacheManager compositeCacheManager = new CompositeCacheManager();
+        
+        // First level: Caffeine (in-memory) cache
+        CaffeineCacheManager caffeineCacheManager = new CaffeineCacheManager();
+        caffeineCacheManager.setCaffeine(Caffeine.newBuilder()
+            .maximumSize(1000)
+            .expireAfterWrite(Duration.ofMinutes(10))
+            .recordStats());
+            
+        // Second level: Redis distributed cache
+        RedisCacheManager redisCacheManager = RedisCacheManager.builder(
+            lettuceConnectionFactory())
+            .cacheDefaults(RedisCacheConfiguration.defaultCacheConfig()
+                .entryTtl(Duration.ofHours(1))
+                .serializeKeysWith(RedisSerializationContext
+                    .SerializationPair
+                    .fromSerializer(new StringRedisSerializer()))
+                .serializeValuesWith(RedisSerializationContext
+                    .SerializationPair
+                    .fromSerializer(new GenericJackson2JsonRedisSerializer())))
+            .build();
+            
+        compositeCacheManager.setCacheManagers(Arrays.asList(
+            caffeineCacheManager, 
+            redisCacheManager));
+            
+        return compositeCacheManager;
+    }
+    
+    @Bean
+    public LettuceConnectionFactory lettuceConnectionFactory() {
+        RedisStandaloneConfiguration redisConfig = 
+            new RedisStandaloneConfiguration();
+        redisConfig.setHostName(\"localhost\");
+        redisConfig.setPort(6379);
+        
+        LettuceClientConfiguration clientConfig = LettuceClientConfiguration
+            .builder()
+            .commandTimeout(Duration.ofSeconds(2))
+            .shutdownTimeout(Duration.ofSeconds(2))
+            .build();
+            
+        return new LettuceConnectionFactory(redisConfig, clientConfig);
+    }
+}
+```
+
+Implementing cache synchronization across multiple instances:
+
+```java
+@Service
+@CacheConfig(cacheNames = \"products\")
+public class ProductService {
+    private final ProductRepository productRepository;
+    private final RedisTemplate<String, Object> redisTemplate;
+    
+    @Cacheable(key = \"#id\", unless = \"#result == null\")
+    public Product findById(Long id) {
+        return productRepository.findById(id)
+            .orElseThrow(() -> new ProductNotFoundException(id));
+    }
+    
+    @CachePut(key = \"#product.id\")
+    @Transactional
+    public Product updateProduct(Product product) {
+        // Save to database
+        Product updatedProduct = productRepository.save(product);
+        
+        // Publish cache invalidation event
+        publishCacheInvalidationEvent(product.getId());
+        
+        return updatedProduct;
+    }
+    
+    @CacheEvict(key = \"#id\")
+    @Transactional
+    public void deleteProduct(Long id) {
+        productRepository.deleteById(id);
+        publishCacheInvalidationEvent(id);
+    }
+    
+    private void publishCacheInvalidationEvent(Long productId) {
+        CacheInvalidationEvent event = new CacheInvalidationEvent(
+            \"products\", 
+            productId.toString());
+        redisTemplate.convertAndSend(\"cache-invalidation\", event);
+    }
+}
+
+@Component
+public class CacheInvalidationListener {
+    private final CacheManager cacheManager;
+    
+    @PostConstruct
+    public void init() {
+        // Subscribe to cache invalidation events
+        redisTemplate.listenToChannel(\"cache-invalidation\", message -> {
+            CacheInvalidationEvent event = 
+                objectMapper.readValue(message, CacheInvalidationEvent.class);
+            cacheManager.getCache(event.getCacheName())
+                .evict(event.getKey());
+        });
+    }
+}
+```
+
+Implementing cache-aside pattern with fallback mechanism:
+
+```java
+@Service
+public class ResilientCacheService {
+    private final CacheManager cacheManager;
+    private final ProductRepository productRepository;
+    private final CircuitBreaker circuitBreaker;
+    
+    public Product getProductWithFallback(Long id) {
+        String cacheKey = \"product:\" + id;
+        
+        // Try cache first
+        Product cachedProduct = tryCache(cacheKey);
+        if (cachedProduct != null) {
+            return cachedProduct;
+        }
+        
+        // Cache miss or failure - try database with circuit breaker
+        return circuitBreaker.run(
+            () -> loadAndCacheProduct(id, cacheKey),
+            throwable -> getProductFallback(id));
+    }
+    
+    private Product tryCache(String key) {
+        try {
+            return cacheManager.getCache(\"products\").get(key, Product.class);
+        } catch (Exception e) {
+            log.warn(\"Cache access failed\", e);
+            return null;
+        }
+    }
+    
+    private Product loadAndCacheProduct(Long id, String cacheKey) {
+        Product product = productRepository.findById(id)
+            .orElseThrow(() -> new ProductNotFoundException(id));
+            
+        try {
+            cacheManager.getCache(\"products\").put(cacheKey, product);
+        } catch (Exception e) {
+            log.warn(\"Failed to cache product\", e);
+        }
+        
+        return product;
+    }
+    
+    private Product getProductFallback(Long id) {
+        // Fallback to stale cache if available
+        try {
+            Product staleProduct = cacheManager
+                .getCache(\"stale-products\")
+                .get(id, Product.class);
+                
+            if (staleProduct != null) {
+                log.info(\"Returning stale data for product: {}\", id);
+                return staleProduct;
+            }
+        } catch (Exception e) {
+            log.warn(\"Stale cache access failed\", e);
+        }
+        
+        // Last resort - return default product
+        return Product.getDefaultProduct(id);
+    }
+}
+```
+
+Implementing cache warming and preloading:
+
+```java
+@Component
+public class CacheWarmer implements ApplicationListener<ContextRefreshedEvent> {
+    private final ProductRepository productRepository;
+    private final CacheManager cacheManager;
+    
+    @Override
+    public void onApplicationEvent(ContextRefreshedEvent event) {
+        // Warm up frequently accessed data
+        warmProductCache();
+    }
+    
+    @Scheduled(cron = \"0 0 */1 * * *\") // Every hour
+    public void refreshCache() {
+        warmProductCache();
+    }
+    
+    private void warmProductCache() {
+        Cache productCache = cacheManager.getCache(\"products\");
+        
+        // Load most accessed products
+        List<Product> topProducts = productRepository
+            .findTop100ByOrderByAccessCountDesc();
+            
+        for (Product product : topProducts) {
+            productCache.put(product.getId(), product);
+        }
+        
+        log.info(\"Cache warmed with {} products\", topProducts.size());
+    }
+}
+```
+
+### 19. Asynchronous Processing in Spring Boot
+
+```java
+@Configuration
+@EnableAsync
+public class AsyncConfig {
+    @Bean
+    public Executor taskExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(10);
+        executor.setMaxPoolSize(20);
+        executor.setQueueCapacity(500);
+        executor.setThreadNamePrefix(\"Async-\");
+        executor.initialize();
+        return executor;
+    }
+}
+
+@Service
+public class AsyncService {
+    @Async
+    public CompletableFuture<User> findUser(String email) {
+        return CompletableFuture.supplyAsync(() -> 
+            userRepository.findByEmail(email));
+    }
+}
+```
+
+### 20. Event Processing
+
+```java
+@Component
+public class UserEventPublisher {
+    private final ApplicationEventPublisher publisher;
+
+    public void publishUserCreated(User user) {
+        publisher.publishEvent(new UserCreatedEvent(user));
+    }
+}
+
+@Component
+public class UserEventListener {
+    @EventListener
+    public void handleUserCreated(UserCreatedEvent event) {
+        // Handle user creation event
+    }
+}
+```
+
+### 21. Spring WebFlux
+
+```java
+@RestController
+@RequestMapping(\"/api/users\")
+public class UserController {
+    @GetMapping
+    public Flux<User> getAllUsers() {
+        return userRepository.findAll();
+    }
+
+    @GetMapping(\"/{id}\")
+    public Mono<User> getUser(@PathVariable String id) {
+        return userRepository.findById(id);
+    }
+}
+```
+
+### 22. Error Handling
+
+```java
+@ControllerAdvice
+public class GlobalExceptionHandler {
+    @ExceptionHandler(UserNotFoundException.class)
+    public ResponseEntity<ErrorResponse> handleUserNotFound(UserNotFoundException ex) {
+        return new ResponseEntity<>(
+            new ErrorResponse(\"User not found\"), 
+            HttpStatus.NOT_FOUND
+        );
+    }
+}
+```
+
+### 23. Security Configuration
+
+```java
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig {
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http.authorizeRequests()
+            .antMatchers(\"/public/**\").permitAll()
+            .antMatchers(\"/api/**\").authenticated()
+            .and()
+            .oauth2ResourceServer()
+            .jwt();
+        return http.build();
+    }
+}
+```
+
+### 24. Testing
+
+```java
+@SpringBootTest
+class UserServiceTest {
+    @MockBean
+    private UserRepository userRepository;
+
+    @Autowired
+    private UserService userService;
+
+    @Test
+    void whenFindByEmail_thenReturnUser() {
+        given(userRepository.findByEmail(anyString()))
+            .willReturn(new User(\"test@test.com\"));
+        
+        User found = userService.findByEmail(\"test@test.com\");
+        assertNotNull(found);
+    }
+}
+```
+
+### 25. Monitoring and Metrics
+
+```java
+@Configuration
+public class MetricsConfig {
+    @Bean
+    public MeterRegistry meterRegistry() {
+        return new SimpleMeterRegistry();
+    }
+}
+
+@Service
+public class MonitoredService {
+    private final MeterRegistry registry;
+
+    public void performOperation() {
+        registry.counter(\"operation.count\").increment();
+        // Business logic
+    }
+}
+```
+
+### 26. Configuration Patterns
+
+```java
+@Configuration
+@PropertySource(\"classpath:custom.properties\")
+public class AppConfig {
+    @Value(\"${app.timeout}\")
+    private int timeout;
+
+    @Bean
+    public RestTemplate restTemplate() {
+        RestTemplate template = new RestTemplate();
+        template.setRequestFactory(clientHttpRequestFactory());
+        return template;
+    }
+
+    @Bean
+    public ClientHttpRequestFactory clientHttpRequestFactory() {
+        HttpComponentsClientHttpRequestFactory factory = new HttpComponentsClientHttpRequestFactory();
+        factory.setConnectTimeout(timeout);
+        return factory;
+    }
+}
+```
+
+### 27. Profile-Based Configuration
+
+```yaml
+# application.yml
+spring:
+  profiles:
+    active: dev
+
+---
+spring:
+  config:
+    activate:
+      on-profile: dev
+  datasource:
+    url: jdbc:h2:mem:devdb
+
+---
+spring:
+  config:
+    activate:
+      on-profile: prod
+  datasource:
+    url: jdbc:postgresql://localhost/proddb
+```
+
+### 28. Docker Deployment
+
+```dockerfile
+FROM openjdk:17-jdk-slim
+WORKDIR /app
+COPY target/*.jar app.jar
+EXPOSE 8080
+ENTRYPOINT [\"java\", \"-jar\", \"app.jar\"]
+```
+
+```yaml
+# docker-compose.yml
+version: '3.8'
+services:
+  app:
+    build: .
+    ports:
+      - \"8080:8080\"
+    environment:
+      - SPRING_PROFILES_ACTIVE=prod
+```
+
+### 29. Performance Optimization
+
+```java
+@Configuration
+public class CacheConfig {
+    @Bean
+    public CacheManager cacheManager() {
+        CaffeineCacheManager cacheManager = new CaffeineCacheManager();
+        cacheManager.setCaffeine(Caffeine.newBuilder()
+            .maximumSize(500)
+            .expireAfterWrite(10, TimeUnit.MINUTES));
+        return cacheManager;
+    }
+}
+```
+
+### 30. Microservices Communication
+
+```java
+@FeignClient(name = \"user-service\")
+public interface UserClient {
+    @GetMapping(\"/users/{id}\")
+    User getUser(@PathVariable(\"id\") Long id);
+}
+
+@CircuitBreaker(name = \"userService\")
+@Service
+public class UserService {
+    private final UserClient userClient;
+
+    public User getUserWithFallback(Long id) {
+        return userClient.getUser(id);
+    }
+}
+```
+
+### 31. Database Optimization
+
+```java
+@Repository
+public interface UserRepository extends JpaRepository<User, Long> {
+    @QueryHints(value = {
+        @QueryHint(name = \"org.hibernate.cacheable\", value = \"true\")
+    })
+    Optional<User> findByEmail(String email);
+
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query(\"SELECT u FROM User u WHERE u.id = :id\")
+    Optional<User> findByIdWithLock(@Param(\"id\") Long id);
+}
+```
+
+### 32. Batch Processing
+
+```java
+@Configuration
+@EnableBatchProcessing
+public class BatchConfig {
+    @Bean
+    public Job importJob(JobBuilderFactory jobs, Step step1) {
+        return jobs.get(\"importJob\")
+            .incrementer(new RunIdIncrementer())
+            .flow(step1)
+            .end()
+            .build();
+    }
+
+    @Bean
+    public Step step1(StepBuilderFactory steps) {
+        return steps.get(\"step1\")
+            .<User, User>chunk(10)
+            .reader(reader())
+            .processor(processor())
+            .writer(writer())
+            .build();
+    }
+}
+```
+
+### 33. WebSocket Implementation
+
+```java
+@Configuration
+@EnableWebSocket
+public class WebSocketConfig implements WebSocketConfigurer {
+    @Override
+    public void registerWebSocketHandlers(WebSocketHandlerRegistry registry) {
+        registry.addHandler(new SocketHandler(), \"/websocket\")
+            .setAllowedOrigins(\"*\");
+    }
+}
+
+@Component
+public class SocketHandler extends TextWebSocketHandler {
+    @Override
+    protected void handleTextMessage(WebSocketSession session, TextMessage message) {
+        session.sendMessage(new TextMessage(\"Response to \" + message.getPayload()));
+    }
+}
+```
+
+### 34. Health Checks
+
+```java
+@Component
+public class CustomHealthIndicator implements HealthIndicator {
+    @Override
+    public Health health() {
+        try {
+            // Check service health
+            return Health.up()
+                .withDetail(\"service\", \"running\")
+                .build();
+        } catch (Exception e) {
+            return Health.down()
+                .withException(e)
+                .build();
+        }
+    }
+}
+```
+
+### 35. API Documentation
+
+```java
+@Configuration
+@OpenAPIDefinition(info = @Info(title = \"API Doc\", version = \"1.0\"))
+public class OpenApiConfig {
+    @Bean
+    public OpenAPI customOpenAPI() {
+        return new OpenAPI()
+            .components(new Components()
+                .addSecuritySchemes(\"bearer-jwt\", new SecurityScheme()
+                    .type(SecurityScheme.Type.HTTP)
+                    .scheme(\"bearer\")
+                    .bearerFormat(\"JWT\")));
+    }
+}
+```
+
+### 36. Message Queuing with RabbitMQ
+
+```java
+@Configuration
+public class RabbitConfig {
+    @Bean
+    public Queue queue() {
+        return new Queue(\"messageQueue\", true);
+    }
+
+    @Bean
+    public DirectExchange exchange() {
+        return new DirectExchange(\"messageExchange\");
+    }
+
+    @Bean
+    public Binding binding(Queue queue, DirectExchange exchange) {
+        return BindingBuilder.bind(queue)
+            .to(exchange)
+            .with(\"message.key\");
+    }
+}
+
+@Service
+public class MessageService {
+    private final RabbitTemplate rabbitTemplate;
+
+    public void sendMessage(String message) {
+        rabbitTemplate.convertAndSend(\"messageExchange\", \"message.key\", message);
+    }
+
+    @RabbitListener(queues = \"messageQueue\")
+    public void receiveMessage(String message) {
+        // Process message
+    }
+}
+```
+
+### 37. Rate Limiting
+
+```java
+@Configuration
+public class RateLimitConfig {
+    @Bean
+    public Bucket bucket() {
+        return Bucket4j.builder()
+            .addLimit(Bandwidth.classic(100, Refill.intervally(100, Duration.ofMinutes(1))))
+            .build();
+    }
+}
+
+@RestController
+public class RateLimitedController {
+    private final Bucket bucket;
+
+    @GetMapping(\"/api/resource\")
+    public ResponseEntity<String> getRateLimitedResource() {
+        if (bucket.tryConsume(1)) {
+            return ResponseEntity.ok(\"Success\");
+        }
+        return ResponseEntity.status(429).body(\"Too Many Requests\");
+    }
+}
+```
+
+### 38. File Handling
+
+```java
+@RestController
+@RequestMapping(\"/api/files\")
+public class FileController {
+    @Value(\"${file.upload.dir}\")
+    private String uploadDir;
+
+    @PostMapping(\"/upload\")
+    public ResponseEntity<String> uploadFile(@RequestParam(\"file\") MultipartFile file) {
+        Path filePath = Paths.get(uploadDir, file.getOriginalFilename());
+        Files.copy(file.getInputStream(), filePath, StandardCopyOption.REPLACE_EXISTING);
+        return ResponseEntity.ok(\"File uploaded\");
+    }
+
+    @GetMapping(\"/download/{filename}\")
+    public ResponseEntity<Resource> downloadFile(@PathVariable String filename) {
+        Path path = Paths.get(uploadDir).resolve(filename);
+        Resource resource = new UrlResource(path.toUri());
+        return ResponseEntity.ok()
+            .header(HttpHeaders.CONTENT_DISPOSITION, \"attachment; filename=\\\"\" + resource.getFilename() + \"\\\"\")
+            .body(resource);
+    }
+}
+```
+
+### 39. Validation
+
+```java
+@Data
+public class UserRequest {
+    @NotBlank
+    @Email
+    private String email;
+
+    @NotBlank
+    @Size(min = 8, max = 20)
+    private String password;
+
+    @NotNull
+    @Past
+    private LocalDate birthDate;
+}
+
+@RestController
+@Validated
+public class UserController {
+    @PostMapping(\"/users\")
+    public ResponseEntity<User> createUser(@Valid @RequestBody UserRequest request) {
+        return ResponseEntity.ok(userService.createUser(request));
+    }
+
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    public ResponseEntity<Map<String, String>> handleValidationExceptions(MethodArgumentNotValidException ex) {
+        Map<String, String> errors = new HashMap<>();
+        ex.getBindingResult().getAllErrors().forEach(error -> {
+            String fieldName = ((FieldError) error).getField();
+            String message = error.getDefaultMessage();
+            errors.put(fieldName, message);
+        });
+        return ResponseEntity.badRequest().body(errors);
+    }
+}
+```
+
+### 40. Scheduled Tasks
+
+```java
+@Configuration
+@EnableScheduling
+public class SchedulingConfig {
+    @Bean
+    public TaskScheduler taskScheduler() {
+        ThreadPoolTaskScheduler scheduler = new ThreadPoolTaskScheduler();
+        scheduler.setPoolSize(10);
+        return scheduler;
+    }
+}
+
+@Service
+public class ScheduledService {
+    @Scheduled(fixedRate = 60000) // Every minute
+    public void fixedRateTask() {
+        // Task logic
+    }
+
+    @Scheduled(cron = \"0 0 * * * *\") // Every hour
+    public void cronTask() {
+        // Task logic
+    }
+
+    @Scheduled(initialDelay = 10000, fixedDelay = 60000)
+    public void delayedTask() {
+        // Task logic
+    }
+}
+```
+
+### 41. Dynamic Scheduling
+
+```java
+@Service
+public class DynamicScheduler {
+    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
+    private ScheduledFuture<?> taskFuture;
+
+    public void startScheduledTask(long intervalInSeconds) {
+        stopScheduledTask();
+        taskFuture = scheduler.scheduleAtFixedRate(
+            this::performTask,
+            0,
+            intervalInSeconds,
+            TimeUnit.SECONDS
+        );
+    }
+
+    public void stopScheduledTask() {
+        if (taskFuture != null) {
+            taskFuture.cancel(false);
+        }
+    }
+
+    private void performTask() {
+        // Task implementation
+    }
+}
+```
+
+### 42. Task Execution
+
+```java
+@Configuration
+public class TaskConfig {
+    @Bean
+    public TaskExecutor taskExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(5);
+        executor.setMaxPoolSize(10);
+        executor.setQueueCapacity(25);
+        return executor;
+    }
+}
+
+@Service
+public class TaskService {
+    private final TaskExecutor taskExecutor;
+
+    public void executeTask(Runnable task) {
+        taskExecutor.execute(task);
+    }
+
+    public void executeMultipleTasks(List<Runnable> tasks) {
+        tasks.forEach(taskExecutor::execute);
+    }
+}
+```
 
